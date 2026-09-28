@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Relay - Live Agent Session Viewer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class'
+        }
+    </script>
+</head>
+<body class="bg-gray-900 text-gray-100 min-h-screen flex flex-col">
+    <div class="max-w-4xl mx-auto w-full p-4 flex flex-col flex-1">
+        <header class="mb-6 flex items-center justify-between">
+            <div>
+                <h1 class="text-3xl font-bold text-white">Relay</h1>
+                <p class="text-gray-400">Live multi-step AI agent session viewer</p>
+            </div>
+            <a href="/history.html" class="text-sm text-blue-400 hover:text-blue-300 underline">View all sessions</a>
+        </header>
+
+        <div id="start-form" class="mb-6 p-4 bg-gray-800 rounded-lg">
+            <label class="block text-sm font-medium text-gray-300 mb-2">Task Description</label>
+            <div class="flex gap-2">
+                <input type="text" id="task-input" placeholder="Enter a task for the agent..."
+                    class="flex-1 px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    autocomplete="off">
+                <button id="start-btn"
+                    class="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg transition-colors">
+                    Start Session
+                </button>
+            </div>
+        </div>
+
+        <div id="share-url-container" class="hidden mb-4 p-4 bg-gray-800 rounded-lg">
+            <label class="block text-sm font-medium text-gray-300 mb-2">Share this link:</label>
+            <div class="flex gap-2">
+                <input type="text" id="share-url" readonly
+                    class="flex-1 px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500">
+                <button id="copy-url-btn"
+                    class="px-4 py-2 bg-gray-600 hover:bg-gray-700 text-white font-medium rounded-lg transition-colors">
+                    Copy
+                </button>
+            </div>
+        </div>
+
+        <div id="session-view" class="hidden flex-1 flex flex-col">
+            <div class="flex items-center justify-between mb-4">
+                <div>
+                    <p class="text-sm text-gray-400">Session: <span id="session-id" class="font-mono text-gray-200"></span></p>
+                    <p class="text-sm text-gray-400">Task: <span id="session-task" class="text-gray-200"></span></p>
+                    <p class="text-sm text-gray-400">Owner: <span id="session-owner" class="font-medium text-gray-200">—</span></p>
+                </div>
+                <div class="flex gap-2">
+                    <input type="text" id="steering-input" placeholder="Send steering message..."
+                        class="px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500">
+                    <button id="steering-btn"
+                        class="px-4 py-2 bg-green-600 hover:bg-green-700 text-white font-medium rounded-lg transition-colors">
+                        Send
+                    </button>
+                    <button id="claim-btn"
+                        class="px-4 py-2 bg-yellow-600 hover:bg-yellow-700 text-white font-medium rounded-lg transition-colors">
+                        Claim
+                    </button>
+                </div>
+            </div>
+
+            <div id="step-feed" class="flex-1 overflow-y-auto space-y-3 pr-2">
+            </div>
+            <div id="thinking-indicator" class="hidden mb-2 px-3 py-2 text-sm text-yellow-400 flex items-center gap-2 animate-pulse">
+                <span class="w-2 h-2 bg-yellow-400 rounded-full"></span>
+                <span>Agent is thinking...</span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const startForm = document.getElementById('start-form');
+        const sessionView = document.getElementById('session-view');
+        const shareUrlContainer = document.getElementById('share-url-container');
+        const shareUrlInput = document.getElementById('share-url');
+        const copyUrlBtn = document.getElementById('copy-url-btn');
+        const taskInput = document.getElementById('task-input');
+        const startBtn = document.getElementById('start-btn');
+        const steeringInput = document.getElementById('steering-input');
+        const steeringBtn = document.getElementById('steering-btn');
+        const claimBtn = document.getElementById('claim-btn');
+        const sessionIdEl = document.getElementById('session-id');
+        const sessionTaskEl = document.getElementById('session-task');
+        const sessionOwnerEl = document.getElementById('session-owner');
+        const stepFeed = document.getElementById('step-feed');
+
+        let ws = null;
+        let sessionId = null;
+        let myName = null;
+
+        // Prompt for name immediately on page load (before any WebSocket connection)
+        if (!myName) {
+            const name = prompt('Your name:');
+            myName = (name && name.trim()) ? name.trim() : 'Anonymous';
+        }
+
+        // Detect session ID from URL path (/session/{id})
+        function getSessionIdFromUrl() {
+            const path = window.location.pathname;
+            const match = path.match(/^\/session\/([^/]+)/);
+            return match ? match[1] : null;
+        }
+
+        const stepTypeColors = {
+            'agent_thought': 'bg-blue-900/30 border-blue-700',
+            'steering_message': 'bg-yellow-900/30 border-yellow-700',
+            'tool_call': 'bg-purple-900/30 border-purple-700',
+            'tool_result': 'bg-green-900/30 border-green-700',
+            'error': 'bg-red-900/30 border-red-700'
+        };
+
+        const stepTypeLabels = {
+            'agent_thought': 'THOUGHT',
+            'steering_message': 'STEERING',
+            'tool_call': 'TOOL CALL',
+            'tool_result': 'TOOL RESULT',
+            'error': 'ERROR'
+        };
+
+        function createStepElement(step) {
+            const div = document.createElement('div');
+            const typeClass = stepTypeColors[step.step_type] || 'bg-gray-800 border-gray-600';
+            const label = stepTypeLabels[step.step_type] || step.step_type.toUpperCase();
+
+            div.className = `p-3 rounded-lg border ${typeClass} animate-fade-in`;
+            
+            let contentHtml = `<pre class="whitespace-pre-wrap text-sm text-gray-200 font-mono leading-relaxed">${escapeHtml(step.content)}</pre>`;
+            
+            // For steering messages, style the sender name prominently
+            if (step.step_type === 'steering_message' && step.content.includes(': ')) {
+                const colonIndex = step.content.indexOf(': ');
+                const sender = step.content.substring(0, colonIndex);
+                const message = step.content.substring(colonIndex + 2);
+                contentHtml = `
+                    <div class="flex items-start gap-2">
+                        <span class="px-2 py-0.5 text-xs font-semibold text-yellow-300 bg-yellow-900/30 rounded">${escapeHtml(sender)}</span>
+                        <span class="text-sm text-gray-200 font-mono leading-relaxed whitespace-pre-wrap">${escapeHtml(message)}</span>
+                    </div>
+                `;
+            }
+            
+            div.innerHTML = `
+                <div class="flex items-start gap-3">
+                    <span class="text-xs font-mono text-gray-400 min-w-[3rem]">#${step.step_number}</span>
+                    <span class="px-2 py-0.5 text-xs font-semibold uppercase tracking-wider text-gray-300 bg-gray-700 rounded">${label}</span>
+                    <div class="flex-1 min-w-0">
+                        ${contentHtml}
+                    </div>
+                </div>
+            `;
+            return div;
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function renderStep(step) {
+            const el = createStepElement(step);
+            stepFeed.appendChild(el);
+            stepFeed.scrollTop = stepFeed.scrollHeight;
+        }
+
+        function renderBackfill(steps) {
+            stepFeed.innerHTML = '';
+            steps.forEach(renderStep);
+        }
+
+        async function startSession() {
+            const task = taskInput.value.trim();
+            if (!task) return;
+
+            startBtn.disabled = true;
+            startBtn.textContent = 'Starting...';
+
+            try {
+                const res = await fetch('/api/sessions', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ task })
+                });
+                const data = await res.json();
+                sessionId = data.session_id;
+
+                if (!sessionId) throw new Error('No session ID returned');
+
+                // Update URL to be shareable
+                const newUrl = `/session/${sessionId}`;
+                window.history.pushState({}, '', newUrl);
+                
+                // Show shareable URL
+                const fullUrl = window.location.origin + newUrl;
+                shareUrlInput.value = fullUrl;
+                shareUrlContainer.classList.remove('hidden');
+
+                connectWebSocket(sessionId, task);
+            } catch (err) {
+                console.error(err);
+                alert('Failed to start session: ' + err.message);
+                startBtn.disabled = false;
+                startBtn.textContent = 'Start Session';
+            }
+        }
+
+        function connectWebSocket(sessionId, task) {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${window.location.host}/ws/${sessionId}`);
+
+            ws.onopen = () => {
+                startForm.classList.add('hidden');
+                sessionView.classList.remove('hidden');
+                sessionIdEl.textContent = sessionId;
+                sessionTaskEl.textContent = task;
+            };
+
+            ws.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+                if (msg.type === 'backfill') {
+                    renderBackfill(msg.steps);
+                } else if (msg.type === 'step') {
+                    if (msg.step_type === 'status') {
+                        // Handle thinking/idle status indicator
+                        const indicator = document.getElementById('thinking-indicator');
+                        if (msg.content === 'thinking') {
+                            indicator.classList.remove('hidden');
+                        } else if (msg.content === 'idle') {
+                            indicator.classList.add('hidden');
+                        }
+                    } else {
+                        renderStep(msg);
+                    }
+                } else if (msg.type === 'ownership_changed') {
+                    sessionOwnerEl.textContent = msg.new_owner;
+                }
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket closed');
+            };
+
+            ws.onerror = (err) => {
+                console.error('WebSocket error:', err);
+            };
+        }
+
+        function sendSteering() {
+            const content = steeringInput.value.trim();
+            if (!content || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+            ws.send(JSON.stringify({ type: 'steering', content, sender: myName }));
+            steeringInput.value = '';
+        }
+
+        async function claimSession() {
+            // Use existing name if set, otherwise prompt
+            if (!myName) {
+                const name = prompt('Enter your name to claim this session:');
+                if (!name || !name.trim()) return;
+                myName = name.trim();
+            }
+
+            try {
+                await fetch(`/api/sessions/${sessionId}/claim`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ participant_name: myName })
+                });
+            } catch (err) {
+                console.error(err);
+                alert('Failed to claim session: ' + err.message);
+            }
+        }
+
+        async function copyShareUrl() {
+            try {
+                await navigator.clipboard.writeText(shareUrlInput.value);
+                copyUrlBtn.textContent = 'Copied!';
+                setTimeout(() => { copyUrlBtn.textContent = 'Copy'; }, 2000);
+            } catch (err) {
+                console.error(err);
+                shareUrlInput.select();
+                document.execCommand('copy');
+            }
+        }
+
+        startBtn.addEventListener('click', startSession);
+        taskInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') startSession();
+        });
+
+        steeringBtn.addEventListener('click', sendSteering);
+        steeringInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') sendSteering();
+        });
+
+        claimBtn.addEventListener('click', claimSession);
+        copyUrlBtn.addEventListener('click', copyShareUrl);
+
+        // On page load, check if we're on a session page
+        const urlSessionId = getSessionIdFromUrl();
+        if (urlSessionId) {
+            sessionId = urlSessionId;
+            // Fetch task name first, then connect
+            fetch(`/api/sessions`)
+                .then(res => res.json())
+                .then(sessions => {
+                    const session = sessions.find(s => s.id === sessionId);
+                    const task = session ? session.task : 'Unknown task';
+                    connectWebSocket(sessionId, task);
+                })
+                .catch(err => {
+                    console.error(err);
+                    connectWebSocket(sessionId, 'Unknown task');
+                });
+        }
+    </script>
+    <style>
+        @keyframes fade-in {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .animate-fade-in { animation: fade-in 0.3s ease-out; }
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #1f2937; }
+        ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #6b7280; }
+    </style>
+</body>
+</html>

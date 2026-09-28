@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+websockets
+supabase
+strands-agents
+python-dotenv
